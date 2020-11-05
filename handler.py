@@ -3,12 +3,14 @@ import protocol as cp
 from threading import Thread
 from socket import socket, AF_INET, SOCK_STREAM
 
+
 # erro 001 = usuario nao existente
 # erro 002 = senha errada
 # erro 003 = sem usuario para checar senha
 # erro 004 = usuario nao logado
 # erro 005 = usuario nao encontrado
-
+# erro 006 = primeira mensagem precisa ser chave publica
+# erro 007 = necessario estabelecer chave AES
 class ServerHandler(Thread):
 
     def __init__(self, host, port):
@@ -27,13 +29,13 @@ class ServerHandler(Thread):
         self.active = False
 
     def check_username(self, username):
-        if username in self.users.keys():
+        if username.strip() in self.users.keys():
             return True
         else:
             return False
 
     def check_password(self, username, password):
-        if self.users[username] == password:
+        if self.users[username] == password.strip():
             return True
         else:
             return False
@@ -56,17 +58,15 @@ class ServerHandler(Thread):
                 data += f'{client.username} : {client.addr}\n'
         return data
 
-
     def close_conn(self):
         return
-
 
     def priv(self, data, from_user):
         to_user = data.msgValue.split(' ')[0]
         for client in self.connections:
             if client.username == to_user:
-                msg = cp.prepare_to_send('priv', f'({from_user}): {data.msgValue.split(" ")[1]}')
-                client.conn.sendall(msg.encode())
+                data.prepare_to_send('priv', f'({from_user}): {" ".join(data.msgValue.split(" ")[1:])}')
+                client.conn.sendall(data.encode())
                 return True
         return False  # nao achou para quem mandar
 
@@ -99,86 +99,109 @@ class ConnectionHandler(Thread):
         self.username = ''
         self.password = ''
         self.tent = 0
+        self.cripto = False
 
     def close_conn(self):
         return
 
-
     def run(self):
         print(f'O cliente {self.addr} foi conectado!\n')
 
+        cp_1 = cp.ProtocolMessage()
         with self.conn:
             while self.active:
-                data = self.conn.recv(1024)  # TODO checar que isso aqui pode dar merda lendo só 4 em vez de 5
-                data_rec = cp.read_incoming(data)
-
-                if data_rec.msgType == 'user':
-                    if self.callback.check_username(data_rec.msgValue):
-                        self.username = data_rec.msgValue
-                        print(f'O cliente {self.addr} conectou como {self.username}!\n')
-                        response = cp.prepare_to_send('ok')
-                        self.conn.sendall(response.encode())
+                data = self.conn.recv(4096)
+                if not self.cripto:
+                    cp_1.decode_raw(data)
+                else:
+                    if cp_1.AES_key is None:
+                        cp_1.decode_rsa(data)
                     else:
-                        response = cp.prepare_to_send('err', message='001')  # usuario nao existente
-                        self.conn.sendall(response.encode())
-
-                elif data_rec.msgType == 'pass':
-                    if self.username == '':
-                        response = cp.prepare_to_send('err', message='003')  # nao tinha usuario ainda
-                        self.conn.sendall(response.encode())
-
-                    if self.callback.check_password(self.username, data_rec.msgValue):
-                        self.password = data_rec.msgValue
-                        self.logged = True
-                        print(f'O cliente {self.addr} conectado como {self.username} logou com sucesso!\n')
-                        response = cp.prepare_to_send('ok')
-                        self.conn.sendall(response.encode())
-                    else:
-                        response = cp.prepare_to_send('err', message='002')  # senha errada
-                        self.conn.sendall(response.encode())
-
-                elif data_rec.msgType == 'mesg':
-                    if self.logged:
-                        broad_send = cp.prepare_to_send('brod', self.username + ' ' + data_rec.msgValue)
-                        self.callback.brod(broad_send, self.addr)
-                        print(f'O cliente {self.addr} mandou um texto broadcast : {data_rec.msgValue}\n')
-                    else:
-                        response = cp.prepare_to_send('err', message='004')  # usuario nao logado
-                        self.conn.sendall(response.encode())
-
-                elif data_rec.msgType == 'retr':
-                    if self.logged:
-                        msg = self.callback.retrive_all_connections(self.addr)
-                        response = cp.prepare_to_send('ok', message=msg)
-                        self.conn.sendall(response.encode())
-                    else:
-                        response = cp.prepare_to_send('err', message='004')  # usuario nao logado
-                        self.conn.sendall(response.encode())
-
-                elif data_rec.msgType == 'priv':
-                    if self.logged:
-                        if self.callback.priv(data_rec, self.username):
-                            pass
+                        cp_1.decode_input(data)
+                if cp_1.AES_key is not None:
+                    if cp_1.msgType == 'user':
+                        if self.callback.check_username(cp_1.msgValue):
+                            self.username = cp_1.msgValue
+                            print(f'O cliente {self.addr} conectou como {self.username}!\n')
+                            cp_1.quick_send('ok')
+                            self.conn.sendall(cp_1.encode())
                         else:
-                            response = cp.prepare_to_send('err', message='005')  # usuario nao encontrado
-                            self.conn.sendall(response.encode())
-                    else:
-                        response = cp.prepare_to_send('err', message='004')  # usuario nao logado
-                        self.conn.sendall(response.encode())
+                            cp_1.quick_send('err', message='001')  # usuario nao existente
+                            self.conn.sendall(cp_1.encode())
 
-                elif data_rec.msgType == 'brod':
-                    if self.logged:
+                    elif cp_1.msgType == 'pass':
+                        if self.username == '':
+                            cp_1.quick_send('err', message='003')  # nao tinha usuario ainda
+                            self.conn.sendall(cp_1.encode())
+
+                        if self.callback.check_password(self.username, cp_1.msgValue):
+                            self.password = cp_1.msgValue
+                            self.logged = True
+                            print(f'O cliente {self.addr} conectado como {self.username} logou com sucesso!\n')
+                            cp_1.quick_send('ok')
+                            self.conn.sendall(cp_1.encode())
+                        else:
+                            cp_1.quick_send('err', message='002')  # senha errada
+                            self.conn.sendall(cp_1.encode())
+
+                    elif cp_1.msgType == 'mesg':
+                        if self.logged:
+                            cp_1.quick_send('brod', self.username + ' ' + cp_1.msgValue)
+                            self.callback.brod(cp_1, self.addr)
+                            print(f'O cliente {self.addr} mandou um texto broadcast : {cp_1.msgValue}\n')
+                        else:
+                            cp_1.quick_send('err', message='004')  # usuario nao logado
+                            self.conn.sendall(cp_1.encode())
+
+                    elif cp_1.msgType == 'retr':
+                        if self.logged:
+                            msg = self.callback.retrive_all_connections(self.addr)
+                            cp_1.quick_send('ok', message=msg)
+                            self.conn.sendall(cp_1.encode())
+                        else:
+                            cp_1.quick_send('err', message='004')  # usuario nao logado
+                            self.conn.sendall(cp_1.encode())
+
+                    elif cp_1.msgType == 'priv':
+                        if self.logged:
+                            if self.callback.priv(cp_1, self.username):
+                                pass
+                            else:
+                                cp_1.quick_send('err', message='005')  # usuario nao encontrado
+                                self.conn.sendall(cp_1.encode())
+                        else:
+                            cp_1.quick_send('err', message='004')  # usuario nao logado
+                            self.conn.sendall(cp_1.encode())
+
+                    elif cp_1.msgType == 'brod':
+                        if self.logged:
+                            ...
+                        else:
+                            cp_1.quick_send('err', message='004')  # usuario nao logado
+                            self.conn.sendall(cp_1.encode())
+
+                    elif cp_1.msgType == 'clos':
+                        print(f'O cliente {self.addr} conectado como {self.username} desconectou com sucesso!\n')
+                        self.active = False
+                        self.callback.connections.remove(self)
+
+                    elif cp_1.msgType == 'ok  ':
                         ...
+                    elif cp_1.msgType == 'err ':
+                        ...
+                else:
+                    if cp_1.msgType == 'publ':
+                        cp_1.other_key = cp_1.msgValue
+                        cp_1.quick_send('publ', message=cp_1.public_key,connection=True)
+                        self.conn.sendall(cp_1.encode_raw())
+                        self.cripto = True
+
+                    elif cp_1.msgType == 'aesk':
+                        cp_1.AES_key = cp_1.msgValue.encode('utf-8')
+                        cp_1.quick_send('ok')
+                        self.conn.sendall(cp_1.encode_raw())
+
                     else:
-                        response = cp.prepare_to_send('err', message='004')  # usuario nao logado
-                        self.conn.sendall(response.encode())
+                        cp_1.quick_send('err', message='007')
+                        self.conn.sendall(cp_1.encode_raw())
 
-                elif data_rec.msgType == 'clos':
-                    print(f'O cliente {self.addr} conectado como {self.username} desconectou com sucesso!\n')
-                    self.active = False
-                    self.callback.connections.remove(self)
-
-                elif data_rec.msgType == 'ok  ':
-                    ...
-                elif data_rec.msgType == 'err ':
-                    ...
